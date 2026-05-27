@@ -1,5 +1,116 @@
 MIT License
+import numpy as np
+import pandas as pd
 
+
+def twap_resample(
+    df: pd.DataFrame,
+    freq: str,
+    *,
+    time_col: str = "time",
+    price_col: str = "price",
+    start=None,
+    end=None,
+    require_full_bucket: bool = True,
+) -> pd.Series:
+    """
+    Step-function TWAP for irregular tick data.
+
+    Assumption:
+        price at time t is valid until the next tick.
+
+    require_full_bucket=True:
+        A bucket is NaN unless we know the price for the full bucket,
+        including the price carried into the bucket start.
+    """
+
+    name = f"{price_col}_twap"
+
+    x = df[[time_col, price_col]].copy()
+    x[time_col] = pd.to_datetime(x[time_col], errors="coerce")
+
+    x = (
+        x.dropna(subset=[time_col, price_col])
+         .sort_values(time_col)
+         .drop_duplicates(time_col, keep="last")
+    )
+
+    if x.empty:
+        return pd.Series(dtype="float64", name=name)
+
+    s = x.set_index(time_col)[price_col].astype("float64").sort_index()
+
+    tz = getattr(s.index, "tz", None)
+
+    def parse_ts(v):
+        ts = pd.Timestamp(v)
+        if tz is not None:
+            if ts.tzinfo is None:
+                ts = ts.tz_localize(tz)
+            else:
+                ts = ts.tz_convert(tz)
+        return ts
+
+    start = s.index.min().floor(freq) if start is None else parse_ts(start)
+    end = s.index.max().ceil(freq) if end is None else parse_ts(end)
+
+    if end <= start:
+        raise ValueError("end must be after start")
+
+    # Bucket edges.
+    edges = pd.date_range(start=start, end=end, freq=freq)
+
+    if len(edges) < 2 or edges[0] != start or edges[-1] != end:
+        raise ValueError(
+            "start and end must align with the frequency grid. "
+            "For arbitrary custom bucket edges, use a custom edges-based variant."
+        )
+
+    # Keep ticks before start because the last price before start carries into the bucket.
+    s_to_end = s.loc[:end]
+
+    # Add bucket edges into the tick timeline so intervals are split exactly at bucket boundaries.
+    grid_index = s_to_end.index.union(edges)
+    grid = s_to_end.reindex(grid_index).sort_index().ffill().loc[start:end]
+
+    if len(grid) < 2:
+        return pd.Series(index=edges[:-1], data=np.nan, dtype="float64", name=name)
+
+    # Price is valid from grid[i] until grid[i + 1].
+    times_ns = grid.index.asi8
+    dt_ns = np.diff(times_ns)
+
+    prices = grid.to_numpy(dtype="float64")[:-1]
+    valid = np.isfinite(prices)
+
+    intervals = pd.DataFrame(
+        {
+            "price_time": np.where(valid, prices * dt_ns, 0.0),
+            "covered_time": np.where(valid, dt_ns, 0),
+        },
+        index=grid.index[:-1],
+    )
+
+    sums = (
+        intervals
+        .resample(freq, closed="left", label="left", origin=start)
+        .sum()
+        .reindex(edges[:-1], fill_value=0)
+    )
+
+    bucket_ns = pd.Series(
+        np.diff(edges.asi8),
+        index=edges[:-1],
+        name="bucket_time",
+    )
+
+    if require_full_bucket:
+        out = sums["price_time"] / bucket_ns
+        out = out.where(sums["covered_time"].eq(bucket_ns))
+    else:
+        out = sums["price_time"] / sums["covered_time"].replace(0, np.nan)
+
+    return out.rename(name)
 Copyright (c) 2022 Leonard D. Vorbeck
 
 Permission is hereby granted, free of charge, to any person obtaining a copy
